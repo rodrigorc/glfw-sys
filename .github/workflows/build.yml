@@ -2,69 +2,123 @@ name: Build
 on: [push, pull_request]
 
 jobs:
+  build:
+    name: Build
+    strategy:
+      matrix: 
+        os: [ubuntu, macos, windows]
 
-    build-linux-x11-clang:
-        name: X11 (Linux, Clang)
-        runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}-latest
+
+    env:
+      CARGO_TERM_VERBOSE: true # for better logs if something goes wrong
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true # for glfw submodule
+
+      - name: Install dependencies (Linux)
+        if: matrix.os == 'ubuntu'
+        run: |
+          sudo apt update
+          sudo apt install libwayland-dev libxkbcommon-dev xorg-dev libgl-dev libx11-dev libxkbfile-dev libglx-dev libinput-dev libegl-dev
+
+      # To check vulkan bindings.
+      - name: Prepare Vulkan SDK
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        with:
+          vulkan-query-version: latest
+          vulkan-components: Vulkan-Headers
+          vulkan-use-cache: true
+
+      - name: Source build with static link
+        shell: bash
+        run: cargo clean && cargo run -vv --example=version --features=src-build,static-link
+      
+      - name: Source build with shared link
+        shell: bash
+        run: cargo clean && cargo run -vv --example=version --features=src-build
+
+      - name: Prebuilt libs with static link (Non-Linux)
+        shell: bash
+        # linux pre-built static libs are not provided, so, static linkign requires src-build.
+        if: matrix.os != 'ubuntu'
+        run: cargo clean && cargo run -vv --example=version --features=static-link,prebuilt-libs
+      
+      - name: Prebuilt libs with shared link
+        shell: bash
+        if: matrix.os != 'ubuntu'
+        run: cargo clean && cargo run -vv --example=version --features=prebuilt-libs
+            
+      - name: Install Glfw Packages (MacOs)
+        if: matrix.os == 'macos'
+        shell: bash
+        run: brew install glfw
+
+      - name: PkgConfig build with static linking (MacOs)
+        if: matrix.os == 'macos'
+        shell: bash
+        run: cargo clean && cargo run -vv --example=version --features=static-link
+      
+
+      - name: PkgConfig build with shared linking (MacOs)
+        if: matrix.os == 'macos'
+        shell: bash
+        run: cargo clean && cargo run -vv --example=version
+      
+
+      # ubuntu 24.04 doesn't have glfw 3.4 yet (as of 26th April 2025)
+      # so, we must build from source for glfw binaries
+      # We build and store the binaries in build_shared and build_static directories
+      - name: Build Glfw Package for Linux
+        if: matrix.os == 'ubuntu'
+        shell: bash
+        run: |
+          export COMMON_OPTIONS="-DGLFW_BUILD_EXAMPLES=OFF -DGLFW_BUILD_TESTS=OFF -DGLFW_BUILD_DOCS=OFF -DCMAKE_BUILD_TYPE=Debug -DGLFW_BUILD_WAYLAND=ON -DGLFW_BUILD_X11=ON"
+          cmake -S glfw -B build_shared -DGLFW_LIBRARY_TYPE=SHARED -DCMAKE_INSTALL_PREFIX=$PWD/build_shared $COMMON_OPTIONS
+          cmake --build build_shared
+          cmake --install build_shared
+          cmake -S glfw -B build_static -DGLFW_LIBRARY_TYPE=STATIC -DCMAKE_INSTALL_PREFIX=$PWD/build_static $COMMON_OPTIONS
+          cmake --build build_static
+          cmake --install build_static
+
+      - name: PkgConfig build with static linking (Linux)
+        if: matrix.os == 'ubuntu'
+        shell: bash
         env:
-            CC: clang
-            CFLAGS: -Werror
-        steps:
-            - uses: actions/checkout@v4
-              with:
-                submodules: recursive
-            - name: Install dependencies
-              run: |
-                  sudo apt update
-                  sudo apt install libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev
-
-            - name: Tests
-              run: cargo test
-
-    build-linux-wayland-clang:
-        name: Wayland (Linux, Clang)
-        runs-on: ubuntu-latest
+          PKG_CONFIG_PATH: ${{github.workspace}}/build_static/lib/pkgconfig
+        run: cargo clean && cargo run -vv --example=version --features=static-link
+        
+      - name: PkgConfig build with shared linking (Linux)
+        if: matrix.os == 'ubuntu'
+        shell: bash
         env:
-            CC: clang
-            CFLAGS: -Werror
-        steps:
-            - uses: actions/checkout@v4
-              with:
-                submodules: recursive
-            - name: Install dependencies
-              run: |
-                  sudo apt update
-                  sudo apt install wayland-protocols libwayland-dev libxkbcommon-dev extra-cmake-modules
+          PKG_CONFIG_PATH: ${{github.workspace}}/build_shared/lib/pkgconfig
+          LD_LIBRARY_PATH: ${{github.workspace}}/build_shared/lib
+        run: cargo clean && cargo run -vv --example=version
+    
+      # We don't pass --no-default-features, so, this generates bindings for 
+      # vulkan and native-gl/egl + other handles too by including system headers.
+      - name: Generate Bindings
+        shell: bash
+        run: cargo clean && cargo run -vv --example=version --features=bindgen,src-build
+      
+      # Just to make sure that the script works on all platforms.
+      - name: Check gen_bindings.sh script
+        shell: bash
+        run: |
+          # bindgen-cli binary is not available for windows for some reason
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            cargo install bindgen-cli
+          else
+            curl --proto '=https' --tlsv1.2 -LsSf https://github.com/rust-lang/rust-bindgen/releases/download/v0.71.1/bindgen-cli-installer.sh | sh
+          fi
+          
+          ./gen_bindings.sh ./bindings.rs
 
-            - name: Tests
-              run: cargo test --features wayland
+          # lets log any differences between what is committed and what is generated.
+          # the "|| true" part is to avoid failing the build if there's any differences 
+          diff -ub ./src/sys/pregenerated.rs ./bindings.rs || true 
 
-    build-macos-cocoa-clang:
-        name: Cocoa (macOS, Clang)
-        runs-on: macos-latest
-        env:
-            CFLAGS: -Werror
-            MACOSX_DEPLOYMENT_TARGET: 10.8
-        steps:
-            - uses: actions/checkout@v4
-              with:
-                submodules: recursive
-
-            - uses: dtolnay/rust-toolchain@stable
-            - name: Tests
-              run: cargo test
-
-    build-windows-win32-vs2019:
-        name: Win32 (Windows, VS2019)
-        runs-on: windows-latest
-        env:
-            CFLAGS: /WX
-        steps:
-            - uses: actions/checkout@v4
-              with:
-                submodules: recursive
-
-            - uses: dtolnay/rust-toolchain@stable
-            - name: Tests
-              run: cargo test
-
+      
